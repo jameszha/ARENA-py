@@ -1,0 +1,26 @@
+{
+    "programs": [{
+        "name": "ARB",
+        "type": "python",
+        "request": "launch",
+        "program": "~/git/arena-py/tools/arb/arb.py",
+        "cwd": "",
+        "args": [
+            "arb-arts",
+            "-d",
+            "-b",
+            "localhost",
+            "-n",
+            "public",
+            "-m",
+            "~/git/arena-py/tools/arb/arb-manifest.json",
+        ]
+    }, {
+        "name": "Avatar",
+        "type": "python",
+        "request": "launch",
+        "program": "~/git/arena-py/tools/avatar/avatar.py",
+        "cwd": "",
+        "args": []
+    }]
+}
