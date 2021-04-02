@@ -19,20 +19,20 @@ from . import auth
 
 class Scene(object):
     """
-    Main ARENA client for ARENA-py.
+    Gives access to an ARENA scene.
     Wrapper around Paho MQTT client and EventLoop.
-    Can create and execute various user-defined functions.
+    Can create and execute various user-defined functions/tasks.
     """
     def __init__(
                 self,
-                debug = False,
-                network_loop_interval = 0,  # throttle mqtt client network loop
                 network_latency_interval = 10000,  # run network latency update every 10s
                 on_msg_callback = None,
                 new_obj_callback = None,
                 user_join_callback = None,
                 user_left_callback = None,
                 delete_obj_callback = None,
+                end_program_callback = None,
+                debug = False,
                 **kwargs
             ):
         if os.environ.get("MQTTH"):
@@ -63,11 +63,14 @@ class Scene(object):
 
         print("=====")
         # do user auth
+        username = None
+        password = None
         if os.environ.get("ARENA_USERNAME") and os.environ.get("ARENA_PASSWORD"):
             username = os.environ["ARENA_USERNAME"]
             password = os.environ["ARENA_PASSWORD"]
         else:
             username = auth.authenticate_user(self.host, debug=self.debug)
+
         if os.environ.get("NAMESPACE"):
             self.namespace = os.environ["NAMESPACE"]
         elif "namespace" not in kwargs:
@@ -79,8 +82,11 @@ class Scene(object):
 
         # set up scene variables
         self.namespaced_scene =  f"{self.namespace}/{self.scene}"
+
         self.root_topic = f"{self.realm}/s/{self.namespaced_scene}"
         self.scene_topic = f"{self.root_topic}/#"   # main topic for entire scene
+        self.persist_url = f"https://{self.host}/persist/{self.namespaced_scene}"
+
         self.latency_topic = "$NETWORK/latency"     # network graph latency update
         self.ignore_topic = f"{self.root_topic}/{self.mqttc_id}/#" # ignore own messages
 
@@ -89,7 +95,7 @@ class Scene(object):
         )
 
         # do scene auth
-        if not (os.environ.get("ARENA_USERNAME") and os.environ.get("ARENA_PASSWORD")):
+        if username is None or password is None:
             data = auth.authenticate_scene(
                             self.host, self.realm,
                             self.namespaced_scene, username,
@@ -107,6 +113,7 @@ class Scene(object):
         self.delete_obj_callback = delete_obj_callback
         self.user_join_callback = user_join_callback
         self.user_left_callback = user_left_callback
+        self.end_program_callback = end_program_callback
 
         self.unspecified_object_ids = set() # objects that exist in the scene,
                                           # but this scene instance does not
@@ -126,18 +133,13 @@ class Scene(object):
         self.mqttc.on_connect = self.on_connect
         self.mqttc.on_disconnect = self.on_disconnect
 
-        self.network_loop_interval = network_loop_interval
-
-        # add mqtt message loop to tasks
-        self.run_async(self.main_loop)
-
         # add main message processing + callbacks loop to tasks
         self.run_async(self.process_message)
 
-        # run network latency update task every 10 secs
-        self.run_forever(self.network_latency_update, interval_ms=network_latency_interval)
+        # update network latency every network_latency_interval secs
+        self.run_forever(self.network_latency_update,
+                         interval_ms=network_latency_interval)
 
-        self.got_message = None
         self.msg_queue = asyncio.Queue()
 
         # connect to mqtt broker
@@ -152,15 +154,6 @@ class Scene(object):
     def generate_client_id(self):
         """Returns a random 6 digit id"""
         return str(random.randrange(100000, 999999))
-
-    async def main_loop(self):
-        """Wait for messages from on_message and queues them for later use"""
-        while True:
-            self.got_message = self.task_manager.create_future()
-            await self.sleep(self.network_loop_interval)
-            msg = await self.got_message
-            await self.msg_queue.put(msg)
-            self.got_message = None
 
     def network_latency_update(self):
         """Update client latency in $NETWORK/latency"""
@@ -242,6 +235,9 @@ class Scene(object):
             # listen to all messages in scene
             client.subscribe(self.scene_topic)
             client.message_callback_add(self.scene_topic, self.on_message)
+
+            # create ARENA-py Objects from persist server
+            # no need to return anything here
             self.get_persisted_objs()
 
             print("Connected!")
@@ -254,8 +250,7 @@ class Scene(object):
         if mqtt.topic_matches_sub(self.ignore_topic, msg.topic):
             return
 
-        if self.got_message:
-            self.got_message.set_result(msg)
+        self.msg_queue.put_nowait(msg)
 
     async def process_message(self):
         """Main message processing function"""
@@ -332,18 +327,18 @@ class Scene(object):
                                     payload
                                 )
 
-                # if its an object the lib has not seen before, call new object callback
+                # if its an object the library has not seen before, call new object callback
                 elif object_id not in self.unspecified_object_ids and self.new_obj_callback:
                     self.callback_wrapper(self.new_obj_callback, obj, payload)
                     self.unspecified_object_ids.add(object_id)
 
-    def callback_wrapper(self, func, arg, src):
+    def callback_wrapper(self, func, arg, msg):
         """Checks for number of arguments for callback"""
         if len(signature(func).parameters) != 3:
             print("[DEPRECATED]", "Callbacks and handlers now take 3 arguments: (scene, obj/evt, msg)!")
             func(arg)
         else:
-            func(self, arg, src)
+            func(self, arg, msg)
 
     def on_disconnect(self, client, userdata, rc):
         """Paho MQTT client on_disconnect callback"""
@@ -354,6 +349,8 @@ class Scene(object):
 
     def disconnect(self):
         """Disconnects Paho MQTT client"""
+        if self.end_program_callback:
+            self.end_program_callback(self)
         self.mqttc.disconnect()
 
     def generate_custom_event(self, evt, action="clientEvent"):
@@ -427,7 +424,7 @@ class Scene(object):
 
     @property
     def all_objects(self):
-        """Returns all objects created by the user"""
+        """Returns all the objects in a scene"""
         return Object.all_objects
 
     def add_object(self, obj):
@@ -515,9 +512,8 @@ class Scene(object):
             obj = self.all_objects[object_id]
             obj.persist = True
         else:
-            persist_url = f'https://{self.host}/persist/{self.namespaced_scene}/{object_id}'
             # pass token to persist
-            data = auth.urlopen(url=persist_url, creds=True)
+            data = auth.urlopen(url=f"{self.persist_url}/{object_id}", creds=True)
             output = json.loads(data)
             if len(output) > 0:
                 output = output[0]
@@ -536,8 +532,7 @@ class Scene(object):
         """Returns a dictionary of persisted objects. [TODO] check object_type"""
         objs = {}
         # pass token to persist
-        data = auth.urlopen(
-            url=f'https://{self.host}/persist/{self.namespaced_scene}', creds=True)
+        data = auth.urlopen(url=self.persist_url, creds=True)
         output = json.loads(data)
         for obj in output:
             if obj["type"] == Object.object_type or obj["type"] == Object.type:
@@ -559,11 +554,19 @@ class Scene(object):
 
     def get_persisted_scene_option(self):
         """Returns a dictionary for scene-options. [TODO] wrap the output as a BaseObject"""
-        scene_opts_url = f'https://{self.host}/persist/{self.namespaced_scene}?type=scene-options'
+        scene_opts_url = f"{self.persist_url}?type=scene-options"
         # pass token to persist
         data = auth.urlopen(url=scene_opts_url, creds=True )
         output = json.loads(data)
         return output
+
+
+    def get_writable_scenes(self):
+        """ Request list of scene names for logged in user account that user has publish permission for.
+        Returns: list of scenes.
+        """
+        return auth.get_writable_scenes(host=self.host, debug=self.debug)
+
 
     def message_callback_add(self, sub, callback):
         """Subscribes to new topic and adds callback"""
@@ -572,6 +575,10 @@ class Scene(object):
     def message_callback_remove(self, sub):
         """Unsubscribes to topic and removes filter for callback"""
         self.mqttc.message_callback_remove(sub)
+
+    def get_user_list(self):
+        """Returns a list of users"""
+        return self.users.values()
 
 class Arena(Scene):
     """
